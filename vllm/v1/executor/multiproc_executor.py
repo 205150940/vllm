@@ -602,9 +602,7 @@ class WorkerProc:
                 logger.exception("WorkerProc hit an exception.")
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
-                if output_rank is None or self.rank == output_rank:
-                    self.worker_response_mq.enqueue(
-                        (WorkerProc.ResponseStatus.FAILURE, str(e)))
+                self.worker_response_mq.enqueue((WorkerProc.ResponseStatus.FAILURE, str(e)))
                 continue
 
             if output_rank is None or self.rank == output_rank:
