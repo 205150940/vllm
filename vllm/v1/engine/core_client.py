@@ -896,7 +896,7 @@ class MPClient(EngineCoreClient):
 
         Thread(
             target=engine_manager.monitor_engine_process,
-            args=(engine_down_callback,),
+            args=(engine_down_callback,self.engine_registry),
             daemon=True,
             name="MPClientEngineMonitor",
         ).start()
