@@ -117,6 +117,8 @@ class ParallelConfig:
     set only in SPMD mode."""
     data_parallel_master_ip: str = "127.0.0.1"
     """IP of the data parallel master."""
+    data_parallel_start_rank: int = 0
+    """Rank of the data parallel group."""
     data_parallel_rpc_port: int = 29550
     """Port for data parallel messaging."""
     data_parallel_master_port: int = 29500

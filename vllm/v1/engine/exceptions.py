@@ -37,6 +37,7 @@ class FaultInfo:
     type: str
     message: str
     engine_id: str
+    engine_identity: bytes | None = None
     timestamp: str | None = None
     additional_info: dict | None = None
 
@@ -52,6 +53,7 @@ class FaultInfo:
         cls,
         exception: Exception,
         engine_id: str | int,
+        engine_identity: bytes | None = None,
         additional_info: dict | None = None,
     ) -> "FaultInfo":
         """Create FaultInfo from an exception."""
@@ -59,6 +61,7 @@ class FaultInfo:
             type=type(exception).__name__,
             message=str(exception),
             engine_id=str(engine_id),
+            engine_identity=engine_identity,
             additional_info=additional_info or {},
         )
 
@@ -85,5 +88,6 @@ class FaultInfo:
             message=data["message"],
             timestamp=data["timestamp"],
             engine_id=data["engine_id"],
+            engine_identity=data["engine_identity"].encode("utf-8"),
             additional_info=data["additional_info"],
         )

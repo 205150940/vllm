@@ -229,11 +229,13 @@ class CoreEngineProcManager:
         )
         logger.error("Engine core proc %s died unexpectedly", died_proc.name)
 
-    def monitor_engine_process(self, engine_down_callback):
+    def monitor_engine_process(self, engine_down_callback,engine_registry):
         """
         Monitor engine core process liveness.
         """
         sentinels = [proc.sentinel for proc in self.processes]
+        pids = [proc.pid for proc in self.processes]
+        pid_mapping = {proc: byte_data for proc, byte_data in zip(pids, engine_registry)}
         while sentinels and not self.shutdown_monitor:
             died = multiprocessing.connection.wait(sentinels)
             for sentinel in died:
@@ -242,6 +244,7 @@ class CoreEngineProcManager:
                     proc for proc in self.processes if proc.sentinel == sentinel
                 )
                 engine_rank = re.match(r"EngineCore_DP(\d+)", died_proc.name).group(1)
+                engine_down_callback(engine_rank, died_proc, pid_mapping[died_proc.pid])
                 engine_down_callback(engine_rank, died_proc)
                 sentinels.remove(sentinel)
 
