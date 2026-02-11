@@ -231,9 +231,7 @@ class EngineCoreSentinel(BaseSentinel):
                 )
         return success
 
-    def descale(self, timeout: int = 1, **kwargs):
-        original_to_new = kwargs["original_to_new"]
-        exclude_dp_ranks: list[int] = kwargs["exclude_dp_ranks"]
+    def descale(self,exclude_dp_ranks: list[int], timeout: int, original_to_new: dict):
         start_time = time.monotonic()
         self.engine_index = original_to_new[str(self.engine_index)]
         self.logger = self._make_logger()
@@ -649,7 +647,7 @@ class EngineCore:
         if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError("Pipeline parallel is not supported for scaling down.")
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        old_dp_size = self.vllm_config.parallel_config.data_parallel_size
+        old_dp_size = self.vllm_config.parallel_config.dp_parallel_size
 
         new_dp_size = old_dp_size - len(exclude_dp_ranks)
         new_ep_size = new_dp_size * tp_size
@@ -672,7 +670,7 @@ class EngineCore:
             self.vllm_config.parallel_config.data_parallel_rank_local
         )
         self.vllm_config.parallel_config.expert_parallel_size \
-            = (data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size)
+            = (data_parallel_size * self.vllm_config.tensor_parallel_size)
         self.vllm_config.parallel_config.data_parallel_master_port += 1000
 
 
