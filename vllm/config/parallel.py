@@ -13,7 +13,7 @@ from torch.distributed import ProcessGroup, ReduceOp
 from typing_extensions import Self
 
 import vllm.envs as envs
-from vllm.config import FaultToleranceConfig
+from vllm.config.fault_tolerance import FaultToleranceConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
