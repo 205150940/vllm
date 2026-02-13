@@ -130,7 +130,7 @@ class EngineCoreSentinel(BaseSentinel):
         self.pp_size = pp_size
         self.dp_size = dp_size
         self.engine_core = engine_core
-
+        self.dealer_socket_identity = dealer_socket_identity
         # Client <-> EngineCoreSentinel sockets
         self.engine_fault_socket = make_zmq_socket(
             self.ctx,
@@ -171,6 +171,8 @@ class EngineCoreSentinel(BaseSentinel):
                 # The busy loop stopped due to another critical exception,
                 # put it back
                 self.logger("Engine paused", level="info")
+            elif "FORCE STOP" in str(engine_exception):
+                self.logger("NPU Stop device and Engine paused",level="info")
             else:
                 self.logger(
                     "Detected exception %s: %s\n Call Stack:\n%s",
@@ -185,7 +187,7 @@ class EngineCoreSentinel(BaseSentinel):
             pass
 
     def _report_exception_to_client_sentinel(self, exception: Exception) -> None:
-        msg = FaultInfo.from_exception(exception, self.engine_index).serialize()
+        msg = FaultInfo.from_exception(exception, self.engine_index, self.dealer_socket_identity).serialize()
         msg_bytes = msg.encode("utf-8")
         self.engine_fault_socket.send_multipart([b"", msg_bytes])
 
@@ -265,23 +267,11 @@ class EngineCoreSentinel(BaseSentinel):
             dp_start_rank
         )
 
-        exclude_ep_ranks = sorted(
-            list(
-                set(
-                    [
-                        i
-                        for rank in exclude_dp_ranks
-                        for i in range(
-                            rank * tensor_model_parallel_size,
-                            (rank + 1) * tensor_model_parallel_size,
-                        )
-                    ]
-                )
-            )
-        )
-        new_ep_size, data_parallel_size, rank_mapping = (
-            self.engine_core.parse_exclude_dp_ranks(exclude_dp_ranks)
-        )
+        exclude_ep_ranks = sorted(list(set([
+            i
+            for rank in exclude_dp_ranks
+            for i in range(rank * tensor_model_parallel_size, (rank + 1) * tensor_model_parallel_size)])))
+        new_ep_size, data_parallel_size,rank_mapping = self.engine_core.parse_exclude_dp_ranks(exclude_dp_ranks)
 
         with set_current_vllm_config(self.engine_core.vllm_config):
             self.engine_core.update_parallel_config(data_parallel_size, rank_mapping)
@@ -362,6 +352,11 @@ class EngineCoreSentinel(BaseSentinel):
         self.engine_running = success
         assert self.cmd_q.empty(), "cmd_q must be empty after execution"
         return success
+
+    def shutdown_engine_core(self, exclude_dp_ranks: list[int]) -> bool:
+        if self.engine_index in exclude_dp_ranks:
+            self.cmd_q.put(serialize_method_call("shutdown"))
+        return True
 
     def _get_target_worker_identity(self):
         identities = set()

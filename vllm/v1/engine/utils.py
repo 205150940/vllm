@@ -212,7 +212,7 @@ class CoreEngineProcManager:
         """Shutdown all procs."""
         self._finalizer()
 
-    def notify_engine_down(self, engine_rank, died_proc):
+    def notify_engine_down(self, engine_rank, died_proc, identity):
         """
         Send fault notification to the engine_down_socket
         and log the failure event.
@@ -221,6 +221,7 @@ class CoreEngineProcManager:
             type="engine_core dead",
             message=f"Engine core proc {died_proc.name} died unexpectedly.",
             engine_id=engine_rank,
+            engine_identity=identity,
             additional_info=None,
         )
 
@@ -235,7 +236,8 @@ class CoreEngineProcManager:
         """
         sentinels = [proc.sentinel for proc in self.processes]
         pids = [proc.pid for proc in self.processes]
-        pid_mapping = {proc: byte_data for proc, byte_data in zip(pids, engine_registry)}
+        logger.info(f'engine_registry is {engine_registry}')
+        pid_mapping = {proc: byte_data for proc, byte_data in zip(pids, engine_registry.values())}
         while sentinels and not self.shutdown_monitor:
             died = multiprocessing.connection.wait(sentinels)
             for sentinel in died:
@@ -245,7 +247,7 @@ class CoreEngineProcManager:
                 )
                 engine_rank = re.match(r"EngineCore_DP(\d+)", died_proc.name).group(1)
                 engine_down_callback(engine_rank, died_proc, pid_mapping[died_proc.pid])
-                engine_down_callback(engine_rank, died_proc)
+                #engine_down_callback(engine_rank, died_proc)
                 sentinels.remove(sentinel)
 
     def join_first(self):

@@ -20,7 +20,7 @@ import msgspec.msgpack
 import ray
 import zmq
 import zmq.asyncio
-
+from vllm.v1.engine.utils import broadcast_instruction
 from vllm.config import FaultToleranceConfig, VllmConfig
 from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S
 from vllm.logger import init_logger
@@ -525,19 +525,22 @@ class ClientSentinel(BaseSentinel):
             "descale",
             target_engines,
             timeout=timeout,
-            original_to_new=original_to_new,
-            exclude_dp_ranks=exclude_dp_ranks
+            exclude_dp_ranks=exclude_dp_ranks,
+            original_to_new=original_to_new
         )
         if success:
             self.engine_running.set()
+            exclude_dp_ranks = kwargs["exclude_dp_ranks"]
+            original_to_new = kwargs["original_to_new"]
+            logger.info(f'original_to_new: {original_to_new} exclude_dp_ranks: {exclude_dp_ranks}')
             dead_engine_identities = [self.engine_registry[dead_engine] for
                                       dead_engine in exclude_dp_ranks]
             temp_kwargs = {"exclude_dp_ranks": exclude_dp_ranks}
-            self.broadcast_instruction(
+            broadcast_instruction(
                 self.downstream_cmd_socket,
                 dead_engine_identities,
                 "shutdown_engine_core",
-                **kwargs,
+                **temp_kwargs,
             )
             for engine_index in exclude_dp_ranks:
                 self.engine_status_dict.pop(engine_index)
@@ -547,19 +550,20 @@ class ClientSentinel(BaseSentinel):
                 for key in key_to_del:
                     del self.engine_identity_to_index[key]
 
-                for old_engine_index in original_to_new:
-                    engine_status = self.engine_status_dict[old_engine_index]
-                    del self.engine_status_dict[old_engine_index]
-                    self.engine_status_dict[
-                        original_to_new[old_engine_index]] = engine_status
+            for old_engine_index in original_to_new:
+                old_engine_index_int = int(old_engine_index)
+                engine_status = self.engine_status_dict[old_engine_index_int]
+                del self.engine_status_dict[old_engine_index_int]
+                self.engine_status_dict[
+                    original_to_new[old_engine_index]] = engine_status
 
-                    engine_identity = self.engine_registry[old_engine_index]
-                    del self.engine_registry[original_to_new[old_engine_index]]
-                    self.engine_registry[original_to_new[old_engine_index]] = engine_identity
+                engine_identity = self.engine_registry[old_engine_index_int]
+                #del self.engine_registry[original_to_new[old_engine_index]]
+                self.engine_registry[original_to_new[old_engine_index]] = engine_identity
 
-                    for identity, engine_index in self.engine_identity_to_index.items():
-                        if engine_index == old_engine_index:
-                            self.engine_identity_to_index[identity] = original_to_new[old_engine_index]
+                for identity, engine_index in self.engine_identity_to_index.items():
+                    if engine_index == old_engine_index:
+                        self.engine_identity_to_index[identity] = original_to_new[old_engine_index]
 
 
     async def handle_fault(self, instruction: str, timeout: int, **kwargs) -> bool:
@@ -946,7 +950,7 @@ class MPClient(EngineCoreClient):
             if not self.vllm_config.fault_tolerance_config.enable_fault_tolerance
             else engine_manager.notify_engine_down
         )
-
+        logger.info(f'self engine_registry is {self.engine_registry}')
         Thread(
             target=engine_manager.monitor_engine_process,
             args=(engine_down_callback,self.engine_registry),

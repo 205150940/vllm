@@ -72,12 +72,15 @@ class FaultInfo:
             "message": self.message,
             "timestamp": self.timestamp,
             "engine_id": self.engine_id,
+            "engine_identity": self.engine_identity,
             "additional_info": self.additional_info,
         }
 
     def serialize(self) -> str:
         """Serialize to JSON string."""
-        return json.dumps(self.to_dict())
+        fault_info_dict = self.to_dict()
+        fault_info_dict['engine_identity'] = self.engine_identity.decode('utf-8')
+        return json.dumps(fault_info_dict)
 
     @classmethod
     def from_json(cls, json_str: str) -> "FaultInfo":
