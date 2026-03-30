@@ -50,7 +50,6 @@ def fail_on_thread_exceptions(thread_excs: Queue) -> None:
         pytest.fail("Thread raised exception:\n" + "\n".join(thread_excs.queue))
 
 
-# todo: check all busy_loop_paused flag being tested
 def create_engine_core_sentinel(
     fault_signal_q: Queue,
     stop_busy_loop: threading.Event,
@@ -141,7 +140,6 @@ def test_busy_loop_exception_forwarded_to_client(addr_dict):
         ctx.term()
 
 
-# todo: check all busy_loop_active related codes
 @pytest.mark.parametrize("instruction", ["pause"])
 def test_engine_core_sentinel_handles_fault_tolerance_instructions(
     instruction, addr_dict
