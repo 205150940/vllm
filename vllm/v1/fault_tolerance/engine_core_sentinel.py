@@ -21,6 +21,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
 )
+from vllm.v1.serial_utils import run_method
 
 if TYPE_CHECKING:
     from vllm.v1.engine.core import EngineCoreProc
@@ -50,7 +51,7 @@ class EngineCoreSentinel(BaseSentinel):
             sentinel_identity,
             engine,
         )
-
+        self.parallel_config = parallel_config
         self.engine_recovery_timeout_sec = (
             parallel_config.fault_tolerance_config.engine_recovery_timeout_sec
         )
@@ -119,6 +120,38 @@ class EngineCoreSentinel(BaseSentinel):
             request_id=ft_request.request_id,
             success=success,
             reason=None if success else "Busy loop did not pause within timeout.",
+        )
+
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        """
+        Handle the retry instruction from the ClientSentinel.
+        This instruction tells the EngineCore to continue its busy loop
+        after being suspended due to an exception.
+        """
+        if not self.busy_loop_paused.is_set():
+            return FaultToleranceResult(ft_request.request_id, True)
+        timeout = ft_request.params["timeout"]
+        self.parallel_config._coord_store_port = ft_request.params["coord_store_port"]
+        self._execute_command_on_workers(
+            FaultToleranceRequest(str(uuid.uuid4()), "retry", ft_request.params),
+            self.worker_identities,
+            timeout=timeout,
+        )
+        if self.parallel_config.data_parallel_size > 1:
+            # If the Gloo communication times out,
+            # the data parallel group (dp_group) needs to be reinitialized\
+            # todo: add reinit_dp_group_on_fault_tolerance
+            reinit_request = FaultToleranceRequest(
+                instruction="reinit_dp_group_on_fault_tolerance",
+                request_id=str(uuid.uuid4()),
+                params={},
+            )
+
+        self.stop_busy_loop.clear()
+        return FaultToleranceResult(
+            request_id=ft_request.request_id,
+            success=True,
+            reason=None if True else "Worker don't recovered within timeout.",
         )
 
     def _execute_command_on_workers(
@@ -212,9 +245,9 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                     #  in the upcoming PRs.
                     time.sleep(self.engine_core_sentinel.engine_recovery_timeout_sec)
 
-                # Fault tolerance not enabled OR no instruction received
-                # before timeout. Re-raise the original exception
-                # for upper level handling.
+                    # Fault tolerance not enabled OR no instruction received
+                    # before timeout. Re-raise the original exception
+                    # for upper level handling.
                 raise
 
     return run_with_fault_tolerance

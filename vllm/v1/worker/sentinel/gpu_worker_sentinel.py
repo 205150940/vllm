@@ -8,7 +8,14 @@ import msgspec
 import torch
 import zmq
 
-from vllm.distributed import get_ep_group, get_pp_group, get_tp_group
+from vllm.config import ParallelConfig
+from vllm.distributed import (
+    get_dp_group,
+    get_ep_group,
+    get_pp_group,
+    get_tp_group,
+    stateless_init_torch_distributed_process_group,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.fault_tolerance import BaseSentinel
@@ -20,6 +27,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _GLOBAL_PAUSE_EVENT = threading.Event()
+
+# Currently, only deepep_ll and nixl_ep backends support fault tolerance.
+_FT_BACKEND_SET = {"deepep_low_latency", "nixl_ep"}
 
 
 def get_pause_event() -> threading.Event:
@@ -34,12 +44,16 @@ class WorkerSentinel(BaseSentinel):
         device: torch.device,
         worker_cmd_addr: str,
     ):
-        dp_rank = worker.parallel_config.data_parallel_rank
+        self.dp_rank = worker.parallel_config.data_parallel_rank
         tp_rank = get_tp_group().rank_in_group
         pp_rank = get_pp_group().rank_in_group
         identity_str = f"PP{pp_rank}_TP{tp_rank}"
-        super().__init__(f"{dp_rank}_{identity_str}", identity_str.encode(), worker)
+        super().__init__(f"{self.dp_rank}_{identity_str}", identity_str.encode(), worker)
         self.device = device
+        self.parallel_config = worker.parallel_config
+        self.data_parallel_master_ip = self.parallel_config.data_parallel_master_ip
+        self.data_parallel_master_port = self.parallel_config.data_parallel_master_port
+        self.dp_size = self.parallel_config.data_parallel_size
         torch.accelerator.set_device_index(self.device)
 
         self.engine_core_cmd_socket = make_zmq_socket(
@@ -50,12 +64,9 @@ class WorkerSentinel(BaseSentinel):
             identity=self.identity,
         )
 
-        # Currently, only deepep_ll and nixl_ep backends support fault tolerance.
-        ft_backend_set = {"deepep_low_latency", "nixl_ep"}
-        parallel_config = worker.parallel_config
         self.use_ft_backend = (
-            parallel_config.all2all_backend in ft_backend_set
-            and parallel_config.data_parallel_size > 1
+            self.parallel_config.all2all_backend in _FT_BACKEND_SET
+            and self.parallel_config.data_parallel_size > 1
         )
         if self.use_ft_backend:
             world_size = get_ep_group().world_size
@@ -89,6 +100,34 @@ class WorkerSentinel(BaseSentinel):
 
     def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         get_pause_event().set()
+        return FaultToleranceResult(ft_request.request_id, True)
+
+    def clear_input_batch_callback(self):
+        input_batch = self.worker.model_runner.input_batch
+        cached_req_ids = input_batch.req_id_to_index.keys()
+        for req_id in list(cached_req_ids):
+            input_batch.remove_request(req_id)
+
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        self.clear_input_batch_callback()
+        get_pause_event().clear()
+        comm = get_ep_group().device_communicator
+        assert comm and comm.all2all_manager
+        if self.parallel_config.all2all_backend not in _FT_BACKEND_SET:
+            return FaultToleranceResult(
+                ft_request.request_id,
+                False,
+                "all2all_backend not supported, must in {}".format(_FT_BACKEND_SET),
+            )
+        comm.all2all_manager.clean_mask()
+
+        get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
+            self.data_parallel_master_ip,
+            ft_request.params["new_stateless_dp_group_port"],
+            self.dp_rank,
+            self.dp_size,
+            backend="gloo",
+        )
         return FaultToleranceResult(ft_request.request_id, True)
 
     def shutdown(self):
