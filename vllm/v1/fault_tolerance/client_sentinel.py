@@ -2,14 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import uuid
-from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 import msgspec.msgpack
 import zmq.asyncio
 from torch.distributed import default_pg_timeout
 
+from vllm.config import ParallelConfig
+from vllm.distributed.utils import init_distributed_coordination
 from vllm.logger import init_logger
-from vllm.utils.network_utils import close_sockets, make_zmq_socket
+from vllm.utils.network_utils import close_sockets, get_open_port, make_zmq_socket
 from vllm.v1.engine import EngineCoreOutputs as FTUtilityOutputs
 from vllm.v1.engine import EngineStatusType, UtilityOutput
 from vllm.v1.fault_tolerance.sentinel import BaseSentinel
@@ -21,9 +23,6 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceZmqAddresses,
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, UtilityResult
-
-if TYPE_CHECKING:
-    from vllm.v1.engine.core_client import AsyncMPClient
 
 logger = init_logger(__name__)
 DEEP_EP_KERNEL_TIMEOUT = 100  # seconds (currently fixed)
@@ -43,15 +42,17 @@ class ClientSentinel(BaseSentinel):
 
     def __init__(
         self,
+        parallel_config: ParallelConfig,
         fault_tolerance_addresses: FaultToleranceZmqAddresses,
-        client: "AsyncMPClient",
+        call_utility_async: Callable,
+        core_engines: list[bytes],
     ):
         self.ctx = zmq.asyncio.Context()
-        super().__init__(None, b"client_sentinel", client)
-        parallel_config = client.vllm_config.parallel_config
-        self.ft_config = parallel_config.fault_tolerance_config
-        self.engine_identities = client.core_engines
+        super().__init__(parallel_config, None, b"client_sentinel")
+        self.engine_identities = core_engines
+        self.call_utility_async = call_utility_async
 
+        self.ft_config = parallel_config.fault_tolerance_config
         self.gloo_timeout_seconds: int = (
             parallel_config.gloo_timeout_seconds
             if parallel_config.gloo_timeout_seconds is not None
@@ -132,6 +133,7 @@ class ClientSentinel(BaseSentinel):
                 self.engine_identities,
             )
         }
+        self._coord_store = None
         asyncio.create_task(self.run())
         asyncio.create_task(self.poll_and_execute_cmd())
 
@@ -152,16 +154,44 @@ class ClientSentinel(BaseSentinel):
         """Expected params: timeout, exclude_engine_index (optional)."""
         exclude_engine_index = ft_request.params.get("exclude_engine_index")
 
-        # Pause all healthy engines except ones being excluded.
+        # Pause all engines except ones already marked dead or being excluded.
         target_engines = [
             self.engine_identities[i - self.start_rank]
             for i, status in self.engine_status_dict.items()
-            if status["status"] == "healthy"
+            if status["status"] != "dead"
             and (exclude_engine_index is None or i not in exclude_engine_index)
         ]
         res = await self._execute_cmd_on_engines(ft_request, target_engines)
         if res.success:
             logger.info("vLLM instance is paused and waiting for recovery commands.")
+        return res
+
+    async def retry(self, ft_request: FaultToleranceRequest):  # type: ignore[override]
+        """Expected params: timeout."""
+        for engine_status in self.engine_status_dict.values():
+            if engine_status["status"] == EngineStatusType.DEAD.name.lower():
+                logger.error("Engine core is dead; retry won't work.")
+                return FaultToleranceResult(ft_request.request_id, False, "Engine dead")
+
+        ip, store = init_distributed_coordination(self.parallel_config)
+        self._coord_store = store
+        ft_request.params["coord_store_port"] = self.parallel_config._coord_store_port
+        if "new_stateless_dp_group_port" not in ft_request.params:
+            ft_request.params["new_stateless_dp_group_port"] = get_open_port()
+
+        # try to recover all engines except ones already marked dead or being excluded.
+        target_engines = [
+            self.engine_identities[i - self.start_rank]
+            for i, status in self.engine_status_dict.items()
+        ]
+        res = await self._execute_cmd_on_engines(ft_request, target_engines)
+        if res.success:
+            logger.info("vLLM instance is recovered after retry command.")
+            for i in self.engine_status_dict:
+                self.engine_status_dict[i]["status"] = (
+                    EngineStatusType.HEALTHY.name.lower()
+                )
+            await self._pub_engine_status()
         return res
 
     @property
@@ -171,7 +201,6 @@ class ClientSentinel(BaseSentinel):
     async def _pub_engine_status(self):
         engine_status = self.engine_status_dict.copy()
         pub_msg = {
-            "schema_version": 1,
             "total_engines": len(engine_status),
             "engines": [
                 {"id": i, "status": status["status"]}
@@ -189,7 +218,7 @@ class ClientSentinel(BaseSentinel):
         coroutines = []
         # dispatch commands to target engines
         for core_engine in target_engines:
-            coro = self.client._call_utility_async(
+            coro = self.call_utility_async(
                 "handle_fault", ft_request, engine=core_engine
             )
             coroutines.append(coro)
@@ -298,4 +327,5 @@ class ClientSentinel(BaseSentinel):
         self.sentinel_dead = True
         close_sockets([self.fault_receiver_socket, self.fault_state_pub_socket])
         close_sockets(self.ft_request_sockets + self.ft_result_sockets)
+        self._coord_store = None
         super().shutdown()
