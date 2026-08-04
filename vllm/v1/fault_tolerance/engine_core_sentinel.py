@@ -87,6 +87,16 @@ class EngineCoreSentinel:
 
         engine = self.engine
         ft_config = self.parallel_config.fault_tolerance_config
+        batch_block_ids: set[int] = set()
+        pool = engine.scheduler.kv_cache_manager.block_pool
+        for request in engine.scheduler.running:
+            block_ids = engine.scheduler.kv_cache_manager.get_block_ids(
+                request.request_id)
+            for gid_list in block_ids:
+                for blk in gid_list:
+                    if 0 <= blk < len(pool.blocks) and not pool.blocks[blk].is_null:
+                        batch_block_ids.add(blk)
+
         if ft_config.resume_requests_after_recovery:
             timestamp = time.monotonic()
             while engine.scheduler.running:
@@ -100,6 +110,13 @@ class EngineCoreSentinel:
                 None, RequestStatus.FINISHED_ABORTED
             )
             engine._send_abort_outputs(aborted)
+
+        if batch_block_ids:
+            engine.scheduler.kv_cache_manager.evict_blocks(batch_block_ids)
+            # Save the dirty blocks; they are passed to the worker via
+            # ft_request.params on the next retry(), so the worker can
+            # physically zero them in WorkerSentinel._clean_worker_state().
+            self._dirty_block_ids = batch_block_ids
 
         if engine.batch_queue is not None:
             engine.batch_queue.clear()
@@ -139,6 +156,12 @@ class EngineCoreSentinel:
 
         with set_current_vllm_config(engine.vllm_config):
             ft_request.params.update(self._reinit_dp_group())
+        # Pass the dirty KV block ids (collected in on_fault) to the worker,
+        # which zeroes them in WorkerSentinel._clean_worker_state().
+        dirty_blocks = getattr(self, "_dirty_block_ids", None)
+        if dirty_blocks:
+            ft_request.params["dirty_block_ids"] = sorted(dirty_blocks)
+            self._dirty_block_ids = None
         if hasattr(engine, "step_counter"):
             engine.step_counter = 0
 

@@ -52,7 +52,8 @@ class WorkerSentinel:
     def retry(self, ft_request: FaultToleranceRequest):
         torch.accelerator.synchronize()
         params = ft_request.params
-        self._clean_worker_state()
+        dirty_block_ids = params.get("dirty_block_ids")
+        self._clean_worker_state(dirty_block_ids)
         if self.dp_size > 1:
             get_ep_all2all_manager().clean_buffers()
             old_cpu_group = get_dp_group().cpu_group
@@ -67,7 +68,19 @@ class WorkerSentinel:
                 backend="gloo",
             )
 
-    def _clean_worker_state(self):
+    def _zero_kv_blocks(self, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+        runner = self.worker.model_runner
+        if self.worker.use_v2_model_runner:
+            if runner.kv_block_zeroer is None:
+                runner._init_kv_zero_meta()
+            if runner.kv_block_zeroer is not None:
+                runner.kv_block_zeroer.zero_block_ids(block_ids)
+                return
+        runner._zero_block_ids(block_ids)
+
+    def _clean_worker_state(self, dirty_block_ids: list[int] | None = None):
         model_runner = self.worker.model_runner
         model_runner.execute_model_state = None
         ft_config = model_runner.vllm_config.parallel_config.fault_tolerance_config
@@ -90,3 +103,10 @@ class WorkerSentinel:
             input_batch.condense()
             input_batch.refresh_metadata()
             input_batch.req_prompt_embeds.clear()
+
+        if dirty_block_ids:
+            self._zero_kv_blocks(dirty_block_ids)
+            logger.warning(
+                "[FT] Worker zeroed %d dirty KV block(s) during retry: %s",
+                len(dirty_block_ids), dirty_block_ids[:16],
+            )
