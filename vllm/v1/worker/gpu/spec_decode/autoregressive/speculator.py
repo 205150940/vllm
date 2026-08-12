@@ -219,6 +219,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+            parallel_config=self.vllm_config.parallel_config,
         )
 
         self._prepare_eplb_forward(input_batch.num_tokens)
@@ -266,6 +267,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+            parallel_config=self.vllm_config.parallel_config,
         )
 
         # Generate the remaining num_speculative_steps - 1 draft tokens.
