@@ -44,6 +44,10 @@ logger = init_logger(__name__)
 
 FT_UTILITY_METHOD = "handle_fault_tolerance"
 
+# Fixed rendezvous step for steady-state cpu timeout activation: by then,
+# sustained traffic is assumed to have reached every rank.
+STEADY_STATE_ACTIVATION_STEP = 32
+
 
 class EngineCoreSentinel:
     """Manages fault tolerance state for a single engine core."""
@@ -62,6 +66,7 @@ class EngineCoreSentinel:
         self._dp_reinit_epoch = 0
         self._initial_dp_size = parallel_config.data_parallel_size
         self._dead_dp_ranks: set[int] = set()
+        self._steady_state_activated = False
 
     @property
     def coordinator_disabled(self) -> bool:
@@ -71,10 +76,14 @@ class EngineCoreSentinel:
         dummy batches instead."""
         return bool(self._dead_dp_ranks)
 
-    def activate_steady_state_cpu_timeout(self) -> None:
-        """Set gloo cpu groups to the configured steady-state timeout.
-        Called once before the busy loop starts, after all init (weight
-        load, KV, graph capture, handshakes) is done."""
+    def maybe_activate_steady_state_cpu_timeout(self, step_counter: int) -> None:
+        """Activate the steady-state cpu timeout once: at a fixed rendezvous step for
+        dp>1 so all engines activate together after first-request cold costs."""
+        if self._steady_state_activated:
+            return
+        if self._initial_dp_size > 1 and step_counter < STEADY_STATE_ACTIVATION_STEP:
+            return
+        self._steady_state_activated = True
         enter_steady_state()
         timeout_seconds = self.parallel_config.cpu_distributed_timeout_seconds
         if timeout_seconds is None:
@@ -91,6 +100,11 @@ class EngineCoreSentinel:
                     instruction="activate_steady_state_cpu_timeout", params={}
                 ),
             ),
+        )
+        logger.info(
+            "[FT] Steady-state cpu timeout activated on engine %d at step %s",
+            self.engine_index,
+            step_counter,
         )
 
     def handle_command(self, client_idx: int, call_id: int, ft_args: dict):
@@ -446,7 +460,7 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
 
     def run_with_fault_tolerance(self: "EngineCoreProc"):
         if self.enable_fault_tolerance:
-            self.ft_sentinel.activate_steady_state_cpu_timeout()
+            self.ft_sentinel.maybe_activate_steady_state_cpu_timeout(step_counter=1)
         while True:
             try:
                 busy_loop_func(self)
