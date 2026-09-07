@@ -156,17 +156,18 @@ class EngineCoreSentinel:
             worker_ports = json.loads(engine.dp_store.get(worker_key).decode())
             engine_port = int(engine.dp_store.get(engine_key).decode())
 
-        stateless_destroy_torch_distributed_process_group(engine.dp_group)
-        engine.dp_group, engine.dp_store = (
-            stateless_init_torch_distributed_process_group(
-                parallel_config.data_parallel_master_ip,
-                engine_port,
-                parallel_config.data_parallel_rank,
-                parallel_config.data_parallel_size,
-                backend="gloo",
-                return_store=True,
-            )
+        # Build the new group/store before destroying the old one so a
+        # failed init leaves the engine in a consistent, retryable state.
+        new_group, new_store = stateless_init_torch_distributed_process_group(
+            parallel_config.data_parallel_master_ip,
+            engine_port,
+            parallel_config.data_parallel_rank,
+            parallel_config.data_parallel_size,
+            backend="gloo",
+            return_store=True,
         )
+        stateless_destroy_torch_distributed_process_group(engine.dp_group)
+        engine.dp_group, engine.dp_store = new_group, new_store
         return {"new_stateless_dp_group_ports": worker_ports}
 
 
