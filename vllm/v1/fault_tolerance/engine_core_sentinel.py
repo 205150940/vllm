@@ -5,13 +5,18 @@
 import json
 import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from datetime import timedelta
+from typing import TYPE_CHECKING, cast
 
 import msgspec
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
-from vllm.distributed.utils import stateless_init_torch_distributed_process_group
+from vllm.distributed.utils import (
+    enter_steady_state,
+    set_gloo_backend_timeout,
+    stateless_init_torch_distributed_process_group,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.engine import (
@@ -47,6 +52,28 @@ class EngineCoreSentinel:
         self.status_type = EngineStatusType.HEALTHY
         self.fault_info: str | None = None
         self._dp_reinit_epoch = 0
+
+    def activate_steady_state_cpu_timeout(self) -> None:
+        """Set gloo cpu groups to the configured steady-state timeout.
+        Called once before the busy loop starts, after all init (weight
+        load, KV, graph capture, handshakes) is done."""
+        enter_steady_state()
+        timeout_seconds = self.parallel_config.cpu_distributed_timeout_seconds
+        if timeout_seconds is None:
+            return
+        timeout = timedelta(seconds=timeout_seconds)
+        if self.parallel_config.data_parallel_size > 1:
+            set_gloo_backend_timeout(
+                cast("EngineCoreProc", self.engine).dp_group, timeout
+            )
+        self.engine.model_executor.collective_rpc(
+            "handle_ft_command",
+            args=(
+                FaultToleranceRequest(
+                    instruction="activate_steady_state_cpu_timeout", params={}
+                ),
+            ),
+        )
 
     def handle_command(self, client_idx: int, call_id: int, ft_args: dict):
         """Dispatch an FT command by instruction name."""
@@ -175,6 +202,8 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
     """Wrap the busy loop to catch faults and delegate recovery."""
 
     def run_with_fault_tolerance(self: "EngineCoreProc"):
+        if self.enable_fault_tolerance:
+            self.ft_sentinel.activate_steady_state_cpu_timeout()
         while True:
             try:
                 busy_loop_func(self)
