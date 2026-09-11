@@ -23,6 +23,7 @@ from vllm.distributed.utils import (
 )
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import (
     FT_STATUS_CALL_ID,
     EngineCoreOutputs,
@@ -157,8 +158,7 @@ class EngineCoreSentinel:
         engine = self.engine
         aborted = engine.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
         engine._send_abort_outputs(aborted)
-        if engine.batch_queue is not None:
-            engine.batch_queue.clear()
+
         if (
             hasattr(engine.model_executor, "is_failed")
             and engine.model_executor.is_failed
@@ -188,6 +188,40 @@ class EngineCoreSentinel:
         if self.status_type == EngineStatusType.UNHEALTHY:
             self.status_type = EngineStatusType.DEAD
             self._push_status()
+
+    def _clean_batch_queue(self) -> None:
+        """Drain the batch queue instead of clearing it directly.
+
+        The pending futures may hold kv_connector_output that must be
+        consumed (worker-side connectors use get-and-clear semantics),
+        otherwise KV transfer progress would be lost.
+        Note: we don't call scheduler.update_from_output() here; we only
+        update the KV transfer state via the kv_connector_output.
+        """
+        engine = self.engine
+        if engine.batch_queue is None:
+            return
+        scheduler = cast(Scheduler, engine.scheduler)
+
+        while engine.batch_queue:
+            future, _, _ = engine.batch_queue.pop()
+            try:
+                model_output = future.result()
+            except Exception as e:
+                # Failed step: kv_connector_output has already been merged
+                # into the executor's KVOutputAggregator (in get_response),
+                # so it is safe to drop the exception here.
+                logger.warning(
+                    "[FT] Dropping exception from batch queue during fault "
+                    "handling: %s",
+                    e,
+                )
+                continue
+            if model_output is not None:
+                scheduler.ft_update_kv_xfer_finished(
+                    model_output.kv_connector_output
+                )
+        engine.batch_queue.clear()
 
     def _push_status(self, mask: list[int] | None = None):
         """Push current health to the client so it can refresh its cache."""
@@ -391,6 +425,7 @@ class EngineCoreSentinel:
         raise RuntimeError("[FT] Recovery vote failed")
 
     def _mark_healthy(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        self._clean_batch_queue()
         self.status_type = EngineStatusType.HEALTHY
         logger.info("[FT] Engine %d status -> HEALTHY", self.engine_index)
         self.resumed.set()
