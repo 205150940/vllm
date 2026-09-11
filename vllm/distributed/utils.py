@@ -678,6 +678,10 @@ def stateless_init_torch_distributed_process_group(
         pg._set_group_name(group_name)
         _register_process_group(group_name, pg)
 
+    from vllm.platforms import current_platform
+
+    current_platform.on_stateless_process_group_created(pg, str(backend))
+
     if return_store:
         return pg, store
     else:
@@ -691,6 +695,10 @@ def stateless_destroy_torch_distributed_process_group(pg: ProcessGroup) -> None:
     """
     pg.shutdown()
     _unregister_process_group(pg.group_name)
+
+    from vllm.platforms import current_platform
+
+    current_platform.on_stateless_process_group_destroyed(pg)
 
 
 def get_worker_rank_suffix(global_rank: int | None = None) -> str:

@@ -59,50 +59,6 @@ if TYPE_CHECKING:
     )
 
 
-def batch_transfer_weights(
-    model: nn.Module,
-    is_sender: bool,
-    peer_rank: int,
-    dp_group: StatelessGroupCoordinator,
-    expert_weights: Sequence[Iterable[torch.Tensor]],
-) -> None:
-    device_comm = dp_group.device_communicator
-    if device_comm is None:
-        raise ValueError("No device communicator found")
-
-    expert_weights_set = set()
-    for weight_group in expert_weights:
-        for weight in weight_group:
-            expert_weights_set.add(weight.data_ptr())
-
-    state_dict = model.state_dict()
-    all_params = []
-
-    for name, param in state_dict.items():
-        if name.endswith("expert_map") or name.find("._shared_experts") != -1:
-            continue
-        if param.data_ptr() not in expert_weights_set:
-            all_params.append(param.data)
-
-    assert len(all_params) > 0
-    p2p_ops = []
-    for param in all_params:
-        # PyNccl transfers flat memory and does not honor tensor strides.
-        transfer_param = param.contiguous()
-        op = object.__new__(P2POp)
-        op.op = torch.distributed.isend if is_sender else torch.distributed.irecv
-        op.tensor = transfer_param
-        op.group_peer = peer_rank
-        p2p_ops.append(op)
-        if transfer_param is not param:
-            device_comm.batch_isend_irecv(p2p_ops)
-            p2p_ops.clear()
-            if not is_sender:
-                param.copy_(transfer_param)
-    if p2p_ops:
-        device_comm.batch_isend_irecv(p2p_ops)
-
-
 def broadcast_expert_mapping(
     physical_to_logical: torch.Tensor | None,
     num_local_physical_experts: int | None,
@@ -275,6 +231,50 @@ class ElasticEPScalingExecutor:
             model_runner.model_config, eplb_group
         )
 
+    def _batch_transfer_weights(
+        self,
+        model: nn.Module,
+        is_sender: bool,
+        peer_rank: int,
+        dp_group: StatelessGroupCoordinator,
+        expert_weights: Sequence[Iterable[torch.Tensor]],
+    ) -> None:
+        device_comm = dp_group.device_communicator
+        if device_comm is None:
+            raise ValueError("No device communicator found")
+
+        expert_weights_set = set()
+        for weight_group in expert_weights:
+            for weight in weight_group:
+                expert_weights_set.add(weight.data_ptr())
+
+        state_dict = model.state_dict()
+        all_params = []
+
+        for name, param in state_dict.items():
+            if name.endswith("expert_map") or name.find("._shared_experts") != -1:
+                continue
+            if param.data_ptr() not in expert_weights_set:
+                all_params.append(param.data)
+
+        assert len(all_params) > 0
+        p2p_ops = []
+        for param in all_params:
+            # PyNccl transfers flat memory and does not honor tensor strides.
+            transfer_param = param.contiguous()
+            op = object.__new__(P2POp)
+            op.op = torch.distributed.isend if is_sender else torch.distributed.irecv
+            op.tensor = transfer_param
+            op.group_peer = peer_rank
+            p2p_ops.append(op)
+            if transfer_param is not param:
+                device_comm.batch_isend_irecv(p2p_ops)
+                p2p_ops.clear()
+                if not is_sender:
+                    param.copy_(transfer_param)
+        if p2p_ops:
+            device_comm.batch_isend_irecv(p2p_ops)
+
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         standby_dp_group = get_standby_dp_group()
         assert standby_dp_group is not None
@@ -312,7 +312,7 @@ class ElasticEPScalingExecutor:
 
         model = self.worker.model_runner.get_model()
         for new_worker_rank in sorted(ranks_to_send):
-            batch_transfer_weights(
+            self._batch_transfer_weights(
                 model=model,
                 is_sender=True,
                 peer_rank=new_worker_rank,
@@ -668,7 +668,7 @@ class ElasticEPScalingExecutor:
             for module in model.modules()
             if is_moe_layer(module)
         ]
-        batch_transfer_weights(
+        self._batch_transfer_weights(
             model=model,
             is_sender=False,
             peer_rank=sender_rank,

@@ -1202,6 +1202,29 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
+    def on_stateless_process_group_created(
+        cls,
+        pg: "ProcessGroup",
+        backend: str,
+    ) -> None:
+        """
+        Hook invoked after a stateless torch-distributed process group is
+        created. Stateless groups are deliberately not registered in
+        torch's global process-group state; platforms that need them to
+        be visible to ``torch.distributed`` module-level APIs can
+        register them here.
+        """
+        return
+
+    @classmethod
+    def on_stateless_process_group_destroyed(cls, pg: "ProcessGroup") -> None:
+        """
+        Mirror hook of ``on_stateless_process_group_created``. Platforms
+        that registered the group must undo the registration here.
+        """
+        return
+
+    @classmethod
     def check_if_supports_dtype(cls, dtype: torch.dtype):
         """
         Check if the dtype is supported by the current platform.
