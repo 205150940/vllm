@@ -63,6 +63,10 @@ def sync_cudagraph_and_dp_padding(
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
     dist.all_reduce(tensor, group=group)
 
+    # Stays at full dp_size width: returned in DPSyncState, where each rank
+    # reads its own dp_rank entry.
+    num_tokens_across_dp = tensor[0]
+
     if parallel_config.enable_fault_tolerance:
         # Per-step barrier over the TP cpu group: a faulted sibling stops
         # arriving, so survivors fail here on the host instead of leaving
@@ -71,15 +75,12 @@ def sync_cudagraph_and_dp_padding(
             dist.barrier(group=get_tp_group().cpu_group)
 
         if dead_dp_ranks := get_dp_group().dead_dp_ranks:
-            # A dead rank's column stays 0 after the SUM allreduce; rewrite
-            # it with aggregate-neutral values: INT32_MAX for the min-
-            # aggregated cg_mode row, and the row max for the uniform-token
-            # row.
-            dead_cols = sorted(dead_dp_ranks)
-            tensor[1, dead_cols] = torch.iinfo(torch.int32).max
-            tensor[2, dead_cols] = tensor[2].max()
+            # Drop the failed ranks' columns so the min / all(==1) agreements
+            # below only see ranks that are still running.
+            tensor = tensor[:, [r for r in range(dp_size) if r not in dead_dp_ranks]]
 
-    num_tokens_across_dp = tensor[0]
+    # Live ranks only
+    num_tokens_across_live_dp = tensor[0]
     cg_mode_across_dp = tensor[1]
     uniform_token_counts_across_dp = tensor[2]
     max_query_lens_across_dp = tensor[3]
@@ -91,7 +92,7 @@ def sync_cudagraph_and_dp_padding(
     ):
         synced_uniform_token_count = None
 
-    if torch.all(num_tokens_across_dp == 0).item():
+    if torch.all(num_tokens_across_live_dp == 0).item():
         synced_desc = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE, num_tokens=0, num_reqs=0
         )
@@ -119,7 +120,7 @@ def sync_cudagraph_and_dp_padding(
         "cudagraph_manager should only be None during profile run, "
         "where synced_cg_mode must be NONE across all DP ranks"
     )
-    synced_num_tokens = int(num_tokens_across_dp.max().item())
+    synced_num_tokens = int(num_tokens_across_live_dp.max().item())
 
     # Varlen decode graphs are selected by the query-length bound, so ranks must agree
     # on it or they pad to different token counts below.
