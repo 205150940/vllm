@@ -55,6 +55,10 @@ def create_error_response(
             err_type = "BadRequestError"
             status_code = HTTPStatus.BAD_REQUEST
             param = None
+        elif isinstance(exc, EngineFaultedError):
+            err_type = "ServiceUnavailableError"
+            status_code = exc.http_status
+            param = None
         elif isinstance(exc, GenerationError):
             err_type = "InternalServerError"
             status_code = exc.status_code

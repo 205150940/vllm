@@ -20,6 +20,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.entrypoints.serve.elastic_ep.middleware import set_scaling_elastic_ep
 from vllm.exceptions import (
+    EngineFaultedError,
     GracefulHTTPError,
     MaxQueuedTokensError,
     QueueOverflowError,
@@ -367,6 +368,17 @@ class AsyncLLM(EngineClient):
 
         if self.errored:
             raise EngineDeadError()
+
+        if (
+            self.vllm_config.parallel_config.enable_fault_tolerance
+            and self.engine_core.engine_status.get("status") != "healthy"
+        ):
+            logger.info(
+                "Engine %s - rejecting request %s.",
+                self.engine_core.engine_status.get("status"),
+                request_id,
+            )
+            raise EngineFaultedError()
 
         is_pooling = isinstance(params, PoolingParams)
 
