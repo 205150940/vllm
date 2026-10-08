@@ -187,18 +187,24 @@ class DeviceCommunicatorBase:
         global_ranks: list[int] | None = None,
         global_world_size: int | None = None,
         use_all2all: bool = False,
+        stateless: bool | None = None,
     ):
         self.device = device or torch.device("cpu")
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.unique_name = unique_name
 
-        # Check if this is a stateless process group
-        from torch.distributed.distributed_c10d import _world
+        # Whether this communicator belongs to a stateless process group.
+        # None infers from torch's global ``_world``: stateless groups are
+        # absent from ``pg_map``. StatelessGroupCoordinator passes
+        # ``stateless=True`` explicitly so construction order does not
+        # depend on registration timing.
+        if stateless is None:
+            from torch.distributed.distributed_c10d import _world
 
-        is_stateless = _world.pg_map.get(cpu_group, None) is None
+            stateless = _world.pg_map.get(cpu_group, None) is None
 
-        if is_stateless:
+        if stateless:
             # For stateless groups, we can't use torch.distributed methods
             self.rank = cpu_group.rank()
             self.world_size = cpu_group.size()

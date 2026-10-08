@@ -160,6 +160,13 @@ class StatelessGroupCoordinator(GroupCoordinator):
         self.device_group = self_device_group
         self.tcp_store_group = self_tcp_store_group
 
+        current_platform.on_stateless_process_group_created(
+            self.device_group, self.ranks, backend
+        )
+        current_platform.on_stateless_process_group_created(
+            self.cpu_group, self.ranks, "gloo"
+        )
+
         if current_platform.is_cuda_alike():
             visible_device_index = (
                 current_platform.logical_device_id_to_visible_device_id(
@@ -191,6 +198,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
                 global_world_size=global_world_size,
                 tcp_store_group=self.tcp_store_group,
                 use_all2all=use_all2all,
+                stateless=True,
             )
 
         self.mq_broadcaster = None
@@ -201,11 +209,15 @@ class StatelessGroupCoordinator(GroupCoordinator):
         self.use_cpu_custom_send_recv = False
 
     def destroy(self):
+        from vllm.platforms import current_platform
+
         if self.device_communicator:
             self.device_communicator.destroy()
         if self.device_group:
+            current_platform.on_stateless_process_group_destroyed(self.device_group)
             stateless_destroy_torch_distributed_process_group(self.device_group)
         if self.cpu_group:
+            current_platform.on_stateless_process_group_destroyed(self.cpu_group)
             stateless_destroy_torch_distributed_process_group(self.cpu_group)
 
     def size(self) -> int:

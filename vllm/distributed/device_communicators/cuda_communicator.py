@@ -37,6 +37,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         global_world_size: int | None = None,
         tcp_store_group: StatelessProcessGroup | None = None,
         use_all2all: bool = False,
+        stateless: bool | None = None,
     ):
         super().__init__(
             cpu_group,
@@ -46,6 +47,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_ranks,
             global_world_size,
             use_all2all=use_all2all,
+            stateless=stateless,
         )
         # Match the group name exactly so ETP does not enable TP-only backends.
         if unique_name.split(":")[0] != "tp":
