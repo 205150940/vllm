@@ -623,16 +623,17 @@ def enter_steady_state() -> None:
     _steady_state_entered = True
 
 
+def steady_state_entered() -> bool:
+    return _steady_state_entered
+
+
 def get_cpu_distributed_timeout_or_none() -> timedelta | None:
     from vllm.config import get_current_vllm_config_or_none
 
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         return None
-    parallel_config = vllm_config.parallel_config
-    if parallel_config.enable_fault_tolerance and not _steady_state_entered:
-        return None
-    return parallel_config.cpu_distributed_timeout
+    return vllm_config.parallel_config.effective_cpu_distributed_timeout
 
 
 def set_gloo_backend_timeout(group: ProcessGroup, timeout: timedelta) -> None:
