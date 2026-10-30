@@ -56,6 +56,7 @@ def _reinit_cpu_group(
     host: str,
     rank: int,
     size: int,
+    timeout: timedelta | None = None,
 ) -> None:
     """Rebuild a group's Gloo cpu_group over a port coordinated via ``store``"""
     if rank == 0:
@@ -70,7 +71,7 @@ def _reinit_cpu_group(
         size,
         backend="gloo",
         listen_socket=listen_socket,
-        timeout=get_cpu_distributed_timeout_or_none(),
+        timeout=timeout or get_cpu_distributed_timeout_or_none(),
     )
     stateless_destroy_torch_distributed_process_group(group.cpu_group)
     group.cpu_group = new_group
