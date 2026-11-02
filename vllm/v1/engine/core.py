@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import logging
 import os
 import queue
 import signal
@@ -108,6 +109,37 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+
+# [debug-trace] shared trace file; lazily created, tracing must never break startup.
+_TRACE_LOG_PATH = os.environ.get("VLLM_TRACE_DEBUG_FILE", "/tmp/vllm_debug_trace.log")
+_trace_logger = logging.getLogger("vllm.debug_trace.file")
+_trace_logger.setLevel(logging.INFO)
+_trace_logger.propagate = False
+
+
+def _proc_tag() -> str:
+    try:
+        import setproctitle
+
+        return setproctitle.getproctitle() or f"pid={os.getpid()}"
+    except Exception:
+        return f"pid={os.getpid()}"
+
+
+def _trace(msg: str, *args) -> None:
+    try:
+        if not _trace_logger.handlers:
+            _handler = logging.FileHandler(_TRACE_LOG_PATH)
+            _handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s.%(msecs)03d pid=%(process)d %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            _trace_logger.addHandler(_handler)
+        _trace_logger.info("<%s> " + msg, _proc_tag(), *args)
+    except Exception:
+        pass
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -664,9 +696,21 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        _t0 = time.monotonic()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        _trace(
+            "[engine-step] schedule elapsed=%.1fms num_sched_tokens=%d",
+            (time.monotonic() - _t0) * 1000,
+            scheduler_output.total_num_scheduled_tokens,
+        )
+        _t1 = time.monotonic()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        _trace(
+            "[engine-step] rpc_dispatch elapsed=%.1fms",
+            (time.monotonic() - _t1) * 1000,
+        )
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        _t2 = time.monotonic()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -674,6 +718,10 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        _trace(
+            "[engine-step] wait_worker elapsed=%.1fms",
+            (time.monotonic() - _t2) * 1000,
+        )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -1746,6 +1794,12 @@ class EngineCoreProc(EngineCore):
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
+            _trace(
+                "[request] ADD req_id=%s wave=%s num_prompt_tokens=%d",
+                req.request_id,
+                request_wave,
+                len(req.prompt_token_ids) if hasattr(req, "prompt_token_ids") else -1,
+            )
             if self._reject_add_in_shutdown(req) or self._reject_add_while_paused(req):
                 return
             self.add_request(req, request_wave)
@@ -2419,6 +2473,12 @@ class DPEngineCoreProc(EngineCoreProc):
             if self.ignore_start_dp_wave:
                 return
             new_wave, exclude_eng_index = request
+            _trace(
+                "[request] START_DP_WAVE wave=%d exclude_eng_index=%s engines_running=%s",
+                new_wave,
+                exclude_eng_index,
+                self.engines_running,
+            )
             if exclude_eng_index != self.engine_index and (
                 new_wave >= self.current_wave
             ):
@@ -2488,7 +2548,13 @@ class DPEngineCoreProc(EngineCoreProc):
                 elif not state.commit_requested and state.is_ready_for_switch():
                     self.process_input_queue_block = True
 
+            _t_step = time.monotonic()
             executed = self._process_engine_step()
+            _trace(
+                "[engine-loop] engine_step executed=%s elapsed=%.1fms",
+                executed,
+                (time.monotonic() - _t_step) * 1000,
+            )
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
@@ -2500,8 +2566,13 @@ class DPEngineCoreProc(EngineCoreProc):
                 # Execute a dummy pass when no ready requests ran, unless the
                 # engine is sleeping.
                 elif not self.model_executor.is_sleeping:
+                    _t_dummy = time.monotonic()
                     with self.capture_iteration_details(None) as iteration_details:
                         self.execute_dummy_batch()
+                    _trace(
+                        "[engine-loop] dummy_batch elapsed=%.1fms",
+                        (time.monotonic() - _t_dummy) * 1000,
+                    )
                     if iteration_details is not None and not self.has_coordinator:
                         stats = self._make_iteration_details_stats(iteration_details)
                         self.output_queue.put_nowait(

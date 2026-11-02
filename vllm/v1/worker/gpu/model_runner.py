@@ -18,6 +18,8 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import logging
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
@@ -194,6 +196,39 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+# [debug-trace] stage timer inside execute_model; appends the shared trace file
+# across all processes. Handler is created lazily; tracing must never break
+# startup.
+_TRACE_LOG_PATH = os.environ.get("VLLM_TRACE_DEBUG_FILE", "/tmp/vllm_debug_trace.log")
+_trace_logger = logging.getLogger("vllm.debug_trace.file")
+_trace_logger.setLevel(logging.INFO)
+_trace_logger.propagate = False
+
+
+def _proc_tag() -> str:
+    try:
+        import setproctitle
+
+        return setproctitle.getproctitle() or f"pid={os.getpid()}"
+    except Exception:
+        return f"pid={os.getpid()}"
+
+
+def _trace(msg: str, *args) -> None:
+    try:
+        if not _trace_logger.handlers:
+            _handler = logging.FileHandler(_TRACE_LOG_PATH)
+            _handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s.%(msecs)03d pid=%(process)d %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            _trace_logger.addHandler(_handler)
+        _trace_logger.info("<%s> " + msg, _proc_tag(), *args)
+    except Exception:
+        pass
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1750,6 +1785,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # [debug-trace] per-stage timing of execute_model
+        _stage_ts = time.monotonic()
+
+        def _mr_stage(stage: str) -> None:
+            nonlocal _stage_ts
+            _now = time.monotonic()
+            _trace(
+                "[mr-stage] stage=%s elapsed=%.1fms num_tokens=%d",
+                stage,
+                (_now - _stage_ts) * 1000,
+                scheduler_output.total_num_scheduled_tokens,
+            )
+            _stage_ts = _now
+
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1758,6 +1807,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            _mr_stage("bookkeeping")
             if self.aux_output_connector is not None:
                 # Register this step before the GPU forward.
                 self.aux_output_connector.begin_step(
@@ -1766,6 +1816,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                _mr_stage("no_forward")
                 return self._merge_ec_connector_no_forward(
                     scheduler_output, empty_output
                 )
@@ -1820,10 +1871,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_decode=uniform_tok_count == self.decode_query_len,
             allow_skip_drafts=scheduler_output.skip_drafts,
         )
+        _mr_stage("dp_sync")
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
+            _mr_stage("no_forward")
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
 
         cudagraph_stats = None
@@ -1856,6 +1909,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.num_scheduled_tokens,
                 )
                 self._set_active_loras(*lora_inputs)
+            _mr_stage("prepare_inputs")
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
@@ -1894,6 +1948,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.max_model_len,
                         input_block_tables=block_tables,
                     )
+            _mr_stage("prepare_inputs_dummy")
 
         if self.dcp_size > 1 and not (dummy_run and skip_attn_for_dummy_run):
             input_buffers = self.input_buffers
@@ -1951,6 +2006,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
 
+        _mr_stage("attn_metadata")
         input_ids = input_batch.input_ids
         inputs_embeds = None
         ec_connector_output = None
@@ -2020,6 +2076,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
         self.step_timing.forward_start()
+        _mr_stage("prepare_model_inputs")
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -2071,6 +2128,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        _mr_stage("forward")
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2108,6 +2166,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 0 if skip_drafts else scheduler_output.num_spec_tokens_to_schedule
             ),
         )
+        _mr_stage("postprocess")
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.

@@ -7,6 +7,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
 import functools
+import logging
 import os
 import pickle
 import socket
@@ -35,6 +36,39 @@ from vllm.utils.network_utils import get_tcp_uri
 from vllm.utils.system_utils import suppress_stdout
 
 logger = init_logger(__name__)
+
+# [debug-trace] appends one shared file across all processes, each line tagged
+# with pid. Handler is created lazily on first use so import never fails on
+# file/permission issues; tracing must never break startup.
+_TRACE_LOG_PATH = os.environ.get("VLLM_TRACE_DEBUG_FILE", "/tmp/vllm_debug_trace.log")
+_trace_logger = logging.getLogger("vllm.debug_trace.file")
+_trace_logger.setLevel(logging.INFO)
+_trace_logger.propagate = False
+
+
+def _proc_tag() -> str:
+    try:
+        import setproctitle
+
+        return setproctitle.getproctitle() or f"pid={os.getpid()}"
+    except Exception:
+        return f"pid={os.getpid()}"
+
+
+def _trace(msg: str, *args) -> None:
+    try:
+        if not _trace_logger.handlers:
+            _handler = logging.FileHandler(_TRACE_LOG_PATH)
+            _handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s.%(msecs)03d pid=%(process)d %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            _trace_logger.addHandler(_handler)
+        _trace_logger.info("<%s> " + msg, _proc_tag(), *args)
+    except Exception:
+        pass
 
 # We prefer to use os.sched_yield as it results in tighter polling loops,
 # measured to be around 3e-7 seconds. However on earlier versions of Python
@@ -76,56 +110,91 @@ def cpu_all_reduce_(
     world_size = group.size()
     if world_size == 1:
         return tensor
-    block_size = world_size & -world_size
-    num_blocks = world_size // block_size
-    if tensor.device.type != "cpu" or not tensor.is_contiguous():
-        torch.distributed.all_reduce(tensor, group=group)
+    # [debug-trace] attribute gloo timeouts: when each rank arrives, how long blocked
+    t0 = time.monotonic()
+    group_name = getattr(group, "group_name", "?")
+    group_rank = group.rank()
+    _trace(
+        "[cpu-allreduce] ENTER group=%s rank_in_group=%d size=%d shape=%s",
+        group_name,
+        group_rank,
+        world_size,
+        tuple(tensor.shape),
+    )
+    try:
+        block_size = world_size & -world_size
+        num_blocks = world_size // block_size
+        if tensor.device.type != "cpu" or not tensor.is_contiguous():
+            torch.distributed.all_reduce(tensor, group=group)
+            _trace(
+                "[cpu-allreduce] EXIT  group=%s rank_in_group=%d elapsed=%.1fms",
+                group_name,
+                group_rank,
+                (time.monotonic() - t0) * 1000,
+            )
+            return tensor
+
+        timeout = timeout or timedelta(0)
+
+        rank = group.rank()
+        tag = _CPU_ALL_REDUCE_TAG_BASE
+
+        # Recursive doubling within the block (peers stay in the aligned block).
+        if block_size > 1:
+            # This branch applies only to even world sizes.
+            scratch = torch.empty_like(tensor)
+            mask = 1
+            while mask < block_size:
+                peer = rank ^ mask
+                # Wait for both ops before touching either buffer.
+                recv_work = group.recv([scratch], peer, tag)
+                send_work = group.send([tensor], peer, tag)
+                recv_work.wait(timeout)
+                send_work.wait(timeout)
+                tensor.add_(scratch)
+                mask <<= 1
+                tag += 1
+
+        # Exchange block sums with the same lane in every other block at once.
+        if num_blocks > 1:
+            # This branch applies only when world_size is not a power of two.
+            lane, my_block = rank % block_size, rank // block_size
+            block_sums = [
+                tensor if b == my_block else torch.empty_like(tensor)
+                for b in range(num_blocks)
+            ]
+            works = []
+            for b, buf in enumerate(block_sums):
+                if b != my_block:
+                    works.append(group.recv([buf], b * block_size + lane, tag))
+            for b in range(num_blocks):
+                if b != my_block:
+                    works.append(group.send([tensor], b * block_size + lane, tag))
+            for work in works:
+                work.wait(timeout)
+            # Sum in block order so every rank computes the identical result.
+            total = block_sums[0]
+            for buf in block_sums[1:]:
+                total.add_(buf)
+            tensor.copy_(total)
+        _trace(
+            "[cpu-allreduce] EXIT  group=%s rank_in_group=%d elapsed=%.1fms",
+            group_name,
+            group_rank,
+            (time.monotonic() - t0) * 1000,
+        )
         return tensor
-
-    timeout = timeout or timedelta(0)
-
-    rank = group.rank()
-    tag = _CPU_ALL_REDUCE_TAG_BASE
-
-    # Recursive doubling within the block (peers stay in the aligned block).
-    if block_size > 1:
-        # This branch applies only to even world sizes.
-        scratch = torch.empty_like(tensor)
-        mask = 1
-        while mask < block_size:
-            peer = rank ^ mask
-            # Wait for both ops before touching either buffer.
-            recv_work = group.recv([scratch], peer, tag)
-            send_work = group.send([tensor], peer, tag)
-            recv_work.wait(timeout)
-            send_work.wait(timeout)
-            tensor.add_(scratch)
-            mask <<= 1
-            tag += 1
-
-    # Exchange block sums with the same lane in every other block at once.
-    if num_blocks > 1:
-        # This branch applies only when world_size is not a power of two.
-        lane, my_block = rank % block_size, rank // block_size
-        block_sums = [
-            tensor if b == my_block else torch.empty_like(tensor)
-            for b in range(num_blocks)
-        ]
-        works = []
-        for b, buf in enumerate(block_sums):
-            if b != my_block:
-                works.append(group.recv([buf], b * block_size + lane, tag))
-        for b in range(num_blocks):
-            if b != my_block:
-                works.append(group.send([tensor], b * block_size + lane, tag))
-        for work in works:
-            work.wait(timeout)
-        # Sum in block order so every rank computes the identical result.
-        total = block_sums[0]
-        for buf in block_sums[1:]:
-            total.add_(buf)
-        tensor.copy_(total)
-    return tensor
+    except Exception as e:
+        # [debug-trace] the collective failed (e.g. gloo timeout): record how
+        # long THIS rank waited before blowing up.
+        _trace(
+            "[cpu-allreduce] FAIL  group=%s rank_in_group=%d elapsed=%.1fms err=%s",
+            group_name,
+            group_rank,
+            (time.monotonic() - t0) * 1000,
+            repr(e)[:200],
+        )
+        raise
 
 
 def divide(numerator, denominator):

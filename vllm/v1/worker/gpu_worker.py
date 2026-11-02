@@ -3,6 +3,7 @@
 """A GPU worker class."""
 
 import gc
+import logging
 import os
 import time
 from collections.abc import Callable
@@ -117,6 +118,37 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+# [debug-trace] shared trace file; lazily created, tracing must never break startup.
+_TRACE_LOG_PATH = os.environ.get("VLLM_TRACE_DEBUG_FILE", "/tmp/vllm_debug_trace.log")
+_trace_logger = logging.getLogger("vllm.debug_trace.file")
+_trace_logger.setLevel(logging.INFO)
+_trace_logger.propagate = False
+
+
+def _proc_tag() -> str:
+    try:
+        import setproctitle
+
+        return setproctitle.getproctitle() or f"pid={os.getpid()}"
+    except Exception:
+        return f"pid={os.getpid()}"
+
+
+def _trace(msg: str, *args) -> None:
+    try:
+        if not _trace_logger.handlers:
+            _handler = logging.FileHandler(_TRACE_LOG_PATH)
+            _handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s.%(msecs)03d pid=%(process)d %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            _trace_logger.addHandler(_handler)
+        _trace_logger.info("<%s> " + msg, _proc_tag(), *args)
+    except Exception:
+        pass
 
 
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
@@ -1456,11 +1488,19 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(
-            num_tokens,
-            uniform_decode=True,
-            randomize_inputs=self.randomize_dummy_inputs,
-        )
+        _t0 = time.monotonic()
+        _trace("[dummy-run] ENTER num_tokens=%d", num_tokens)
+        try:
+            self.model_runner._dummy_run(
+                num_tokens,
+                uniform_decode=True,
+                randomize_inputs=self.randomize_dummy_inputs,
+            )
+        finally:
+            _trace(
+                "[dummy-run] EXIT elapsed=%.1fms",
+                (time.monotonic() - _t0) * 1000,
+            )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
